@@ -1,4 +1,4 @@
-"""MPPI Pendulum Control Example - 摆锤控制演示"""
+"""MPPI Pendulum Control Example"""
 import torch
 import numpy as np
 import gymnasium as gym
@@ -14,44 +14,44 @@ from models.observation import ObservationFunction
 
 
 class PendulumTransitionModel(TransitionModel):
-    """摆锤动力学模型"""
+    """Dynamics model of the pendulum env"""
     def __init__(self, dt=0.05, g=10.0, m=1.0, l=1.0, max_speed=8.0):
         self.dt, self.g, self.m, self.l, self.max_speed = dt, g, m, l, max_speed
-    
+
     def forward(self, states, actions, **kwargs):
         cos_theta, sin_theta, theta_dot = states[:, 0], states[:, 1], states[:, 2]
         torque = torch.clamp(actions[:, 0], -2.0, 2.0)
-        theta_ddot = 3*self.g/(2*self.l)*sin_theta + 3/(self.m*self.l**2)*torque
-        new_theta_dot = torch.clamp(theta_dot + theta_ddot*self.dt, -self.max_speed, self.max_speed)
+        theta_ddot = 3 * self.g / (2 * self.l) * sin_theta + 3 / (self.m * self.l ** 2) * torque
+        new_theta_dot = torch.clamp(theta_dot + theta_ddot * self.dt, -self.max_speed, self.max_speed)
         theta = torch.atan2(sin_theta, cos_theta)
-        new_theta = torch.atan2(torch.sin(theta + new_theta_dot*self.dt), torch.cos(theta + new_theta_dot*self.dt))
+        new_theta = torch.atan2(torch.sin(theta + new_theta_dot * self.dt), torch.cos(theta + new_theta_dot * self.dt))
         return torch.stack([torch.cos(new_theta), torch.sin(new_theta), new_theta_dot], dim=1)
 
 
 class PendulumCostFunction(CostFunction):
-    """摆锤成本函数"""
+    """Cost function for the pendulum env"""
     def __init__(self, angle_w=1.0, vel_w=0.1, ctrl_w=0.001):
         self.angle_w, self.vel_w, self.ctrl_w = angle_w, vel_w, ctrl_w
-    
+
     def compute_cost(self, states, actions, **kwargs):
         theta = torch.atan2(states[:, 1], states[:, 0])
         torque = actions[:, 0] if actions.shape[1] > 0 else torch.zeros_like(states[:, 0])
-        return self.angle_w*(theta**2) + self.vel_w*(states[:, 2]**2) + self.ctrl_w*(torque**2)
+        return self.angle_w * (theta ** 2) + self.vel_w * (states[:, 2] ** 2) + self.ctrl_w * (torque ** 2)
 
 
 class PendulumObservationFunction(ObservationFunction):
-    """观测函数（直接返回状态）"""
+    """Observation function (directly returns state)"""
     def state_to_observation(self, state):
         return state
 
 
 def main(render=False):
-    """主函数"""
+    """Main function"""
     env = gym.make('Pendulum-v1', render_mode='human' if render else None)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Device: {device}")
-    
-    # MPPI 参数
+
+    # MPPI parameters
     mppi = MPPIController(
         transition_model=PendulumTransitionModel(),
         cost_function=PendulumCostFunction(),
@@ -60,8 +60,8 @@ def main(render=False):
         noise_std=0.8, temperature=0.5, device=device,
         adaptive_temperature=True, noise_annealing=True, use_log_space_weights=True,
     )
-    
-    # 运行控制
+
+    # Run control
     obs, _ = env.reset()
     mppi.reset()
     returns, states, actions = 0, [], []
@@ -83,8 +83,8 @@ def main(render=False):
             break
     
     env.close()
-    
-    # 绘图
+
+    # Plotting
     states = np.array(states)
     actions = np.array(actions)
     angles = np.arctan2(states[:, 1], states[:, 0])

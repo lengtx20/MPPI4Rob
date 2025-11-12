@@ -31,6 +31,7 @@ setup(
         "torch>=1.9.0",
         "gymnasium>=0.28.0",
         "numpy>=1.19.0",
+        "pygame>=2.6.1"
     ],
     extras_require={
         "dev": [

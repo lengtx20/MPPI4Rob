@@ -1,4 +1,5 @@
 """MPPI Controller - Model Predictive Path Integral Control"""
+
 import torch
 import math
 from typing import Optional, Tuple, Dict, Any
@@ -15,7 +16,8 @@ class MPPIController:
                  action_bounds, noise_std=1.0, temperature=1.0, device='cuda' if torch.cuda.is_available() else 'cpu',
                  use_residual_dynamics=False, baseline_policy=None, observation_function=None,
                  elite_ratio=0.1, smoothing_factor=0.9,
-                 adaptive_temperature=True, noise_annealing=True, use_log_space_weights=True):
+                 adaptive_temperature=True, noise_annealing=True, use_log_space_weights=True,
+                 control_mode: Optional[str] = None):
         self.transition_model = transition_model
         self.cost_function = cost_function
         self.action_dim = action_dim
@@ -38,6 +40,15 @@ class MPPIController:
         self.observation_function = observation_function
         if use_residual_dynamics and (baseline_policy is None or observation_function is None):
             raise ValueError("baseline_policy and observation_function required for residual dynamics")
+        # control_mode: None -> default behavior
+        # if use_residual_dynamics: default -> 'residual+baseline' (returns full action)
+        # else: default -> 'mppi' (standard MPPI output)
+        if control_mode is None:
+            self.control_mode = 'residual+baseline' if use_residual_dynamics else 'mppi'
+        else:
+            assert control_mode in ('mppi', 'residual', 'baseline', 'residual+baseline', 'combined')
+            # accept 'combined' as alias for 'residual+baseline'
+            self.control_mode = 'residual+baseline' if control_mode == 'combined' else control_mode
         self.previous_action_sequence = None
         self.step_count = 0
         self.num_elite = max(1, int(self.num_samples * self.elite_ratio))
@@ -128,7 +139,23 @@ class MPPIController:
         return total_costs, trajectories
     
     def compute_control(self, current_state: torch.Tensor) -> torch.Tensor:
-        """Compute and return the next control action."""
+        """Compute and return the next control action.
+
+        Depending on `self.control_mode` this may return:
+        - 'mppi': the MPPI action (default non-residual)
+        - 'residual': the residual action only
+        - 'baseline': baseline action only
+        - 'residual+baseline': baseline + residual (full action)
+        """
+        # Baseline-only mode
+        if self.control_mode == 'baseline':
+            if self.baseline_policy is None or self.observation_function is None:
+                raise ValueError('baseline_policy and observation_function required for baseline mode')
+            obs = self.observation_function.state_to_observation(current_state.unsqueeze(0))
+            baseline_action = self.baseline_policy.get_action(obs)
+            return baseline_action[0]
+
+        # Sample and evaluate (used by mppi/residual modes)
         action_sequences = self.sample_actions()
         costs, _ = self.rollout(current_state, action_sequences)
         weights = self.compute_weights(costs)
@@ -137,7 +164,22 @@ class MPPIController:
         optimal_action_sequence = torch.sum(weights.unsqueeze(-1).unsqueeze(-1) * action_sequences, dim=0)
         self.previous_action_sequence = optimal_action_sequence.detach()
         self.step_count += 1
-        return optimal_action_sequence[0]
+
+        residual = optimal_action_sequence[0]
+
+        if self.control_mode == 'residual':
+            return residual
+        elif self.control_mode in ('residual+baseline',):
+            # compute baseline for current state and add residual
+            if self.baseline_policy is None or self.observation_function is None:
+                raise ValueError('baseline_policy and observation_function required for residual+baseline mode')
+            obs = self.observation_function.state_to_observation(current_state.unsqueeze(0))
+            baseline_action = self.baseline_policy.get_action(obs)[0]
+            full_action = torch.clamp(baseline_action + residual, self.action_lower_bound, self.action_upper_bound)
+            return full_action
+        else:
+            # 'mppi' default return (treats MPPI action as full action)
+            return residual
     
     def compute_control_with_info(self, current_state: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
         """Compute control and return diagnostic info."""
@@ -149,7 +191,16 @@ class MPPIController:
         optimal_action_sequence = torch.sum(weights.unsqueeze(-1).unsqueeze(-1) * action_sequences, dim=0)
         self.previous_action_sequence = optimal_action_sequence.detach()
         _, elite_indices = torch.topk(-costs, self.num_elite)
-        
+
+        residual = optimal_action_sequence[0]
+
+        baseline_action = None
+        full_action = None
+        if self.baseline_policy is not None and self.observation_function is not None:
+            obs = self.observation_function.state_to_observation(current_state.unsqueeze(0))
+            baseline_action = self.baseline_policy.get_action(obs)[0]
+            full_action = torch.clamp(baseline_action + residual, self.action_lower_bound, self.action_upper_bound)
+
         info = {
             'optimal_action_sequence': optimal_action_sequence,
             'all_costs': costs,
@@ -161,9 +212,20 @@ class MPPIController:
             'temperature': self.temperature,
             'noise_std': self.get_current_noise_std(),
             'weight_entropy': self.compute_weight_entropy(weights),
+            'residual': residual,
+            'baseline_action': baseline_action,
+            'full_action': full_action,
+            'control_mode': self.control_mode,
         }
         self.step_count += 1
-        return optimal_action_sequence[0], info
+        # Return an action consistent with control_mode
+        if self.control_mode == 'baseline':
+            return baseline_action, info
+        if self.control_mode == 'residual':
+            return residual, info
+        if self.control_mode in ('residual+baseline',):
+            return full_action, info
+        return residual, info
     
     def reset(self):
         """Reset internal controller state."""
