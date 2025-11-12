@@ -1,5 +1,6 @@
+"""MPPI Controller - Model Predictive Path Integral Control"""
 import torch
-from abc import ABC, abstractmethod
+import math
 from typing import Optional, Tuple, Dict, Any
 from models.transition_model import TransitionModel
 from models.cost_function import CostFunction
@@ -8,68 +9,98 @@ from models.observation import ObservationFunction
 
 
 class MPPIController:
-    def __init__(
-        self,
-        transition_model: TransitionModel,
-        cost_function: CostFunction,
-        action_dim: int,
-        horizon: int,
-        num_samples: int,
-        action_bounds: Tuple[torch.Tensor, torch.Tensor],
-        noise_std: float = 1.0,
-        temperature: float = 1.0,
-        device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
-
-        use_residual_dynamics: bool = False,
-        baseline_policy: Optional[BaselinePolicy] = None,
-        observation_function: Optional[ObservationFunction] = None,
-
-        elite_ratio: float = 0.1,
-        smoothing_factor: float = 0.9
-    ):
+    """MPPI controller with stability and annealing features."""
+    
+    def __init__(self, transition_model, cost_function, action_dim, horizon, num_samples,
+                 action_bounds, noise_std=1.0, temperature=1.0, device='cuda' if torch.cuda.is_available() else 'cpu',
+                 use_residual_dynamics=False, baseline_policy=None, observation_function=None,
+                 elite_ratio=0.1, smoothing_factor=0.9,
+                 adaptive_temperature=True, noise_annealing=True, use_log_space_weights=True):
         self.transition_model = transition_model
         self.cost_function = cost_function
         self.action_dim = action_dim
         self.horizon = horizon
         self.num_samples = num_samples
         self.device = device
+        self.noise_std_init = noise_std
         self.noise_std = noise_std
+        self.temperature_init = temperature
         self.temperature = temperature
         self.elite_ratio = elite_ratio
         self.smoothing_factor = smoothing_factor
-        
-        # clip
+        self.adaptive_temperature_enabled = adaptive_temperature
+        self.noise_annealing_enabled = noise_annealing
+        self.use_log_space_weights = use_log_space_weights
         self.action_lower_bound = action_bounds[0].to(device)
         self.action_upper_bound = action_bounds[1].to(device)
-        
-        # Residual dynamics
         self.use_residual_dynamics = use_residual_dynamics
         self.baseline_policy = baseline_policy
         self.observation_function = observation_function
-        if use_residual_dynamics:
-            if baseline_policy is None or observation_function is None:
-                raise ValueError("[ERROR] given NO baseline_policy and observation_function")
-        
+        if use_residual_dynamics and (baseline_policy is None or observation_function is None):
+            raise ValueError("baseline_policy and observation_function required for residual dynamics")
         self.previous_action_sequence = None
-        
+        self.step_count = 0
         self.num_elite = max(1, int(self.num_samples * self.elite_ratio))
     
+    def get_current_noise_std(self) -> float:
+        """Return current noise std (cosine annealing)."""
+        if not self.noise_annealing_enabled:
+            return self.noise_std
+        t = min(self.step_count, 100)
+        progress = t / 100.0
+        noise_final = self.noise_std_init * 0.5
+        return noise_final + 0.5 * (self.noise_std_init - noise_final) * (1 + math.cos(math.pi * progress))
+    
+    def compute_weight_entropy(self, weights: torch.Tensor) -> float:
+        """Return Shannon entropy of weights."""
+        weights_safe = torch.clamp(weights, min=1e-10)
+        return -torch.sum(weights * torch.log(weights_safe)).item()
+    
+    def adapt_temperature(self, weights: torch.Tensor) -> None:
+        """Adjust temperature λ based on weight entropy."""
+        if not self.adaptive_temperature_enabled:
+            return
+        entropy = self.compute_weight_entropy(weights)
+        ideal_entropy = math.log(self.num_samples / 5.0)
+        if entropy > ideal_entropy * 1.2:
+            self.temperature = max(0.1, self.temperature * 0.95)
+        elif entropy < ideal_entropy * 0.8:
+            self.temperature = min(2.0, self.temperature * 1.05)
+    
+    def compute_weights(self, costs: torch.Tensor) -> torch.Tensor:
+        """Compute importance weights (log-space for stability)."""
+        if self.use_log_space_weights:
+            log_weights = -(costs - torch.min(costs)) / self.temperature
+            weights = torch.softmax(log_weights, dim=0)
+        else:
+            min_cost = torch.min(costs)
+            exp_costs = torch.exp(-(costs - min_cost) / self.temperature)
+            weights = exp_costs / torch.sum(exp_costs)
+        return weights
+    
+    def set_adaptive_temperature(self, enabled: bool) -> None:
+        """Toggle adaptive temperature."""
+        self.adaptive_temperature_enabled = enabled
+    
+    def set_noise_annealing(self, enabled: bool) -> None:
+        """Toggle noise annealing."""
+        self.noise_annealing_enabled = enabled
+    
     def sample_actions(self) -> torch.Tensor:
+        """Sample action sequences around previous plan."""
         if self.previous_action_sequence is not None:
-            mean_actions = torch.cat([
-                self.previous_action_sequence[1:],
-                torch.zeros(1, self.action_dim, device=self.device)
-            ], dim=0)
+            mean_actions = torch.cat([self.previous_action_sequence[1:],
+                                     torch.zeros(1, self.action_dim, device=self.device)], dim=0)
         else:
             mean_actions = torch.zeros(self.horizon, self.action_dim, device=self.device)
         
+        current_noise_std = self.get_current_noise_std()
         noise = torch.randn(self.num_samples, self.horizon, self.action_dim, device=self.device)
-        noise *= self.noise_std
-        action_sequences = mean_actions.unsqueeze(0) + noise
-        action_sequences = torch.clamp(action_sequences, self.action_lower_bound, self.action_upper_bound)
-        return action_sequences
+        action_sequences = mean_actions.unsqueeze(0) + noise * current_noise_std
+        return torch.clamp(action_sequences, self.action_lower_bound, self.action_upper_bound)
     
     def rollout(self, initial_state: torch.Tensor, action_sequences: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Simulate trajectories and accumulate costs."""
         batch_size = action_sequences.shape[0]
         trajectories = torch.zeros(batch_size, self.horizon + 1, initial_state.shape[0], device=self.device)
         trajectories[:, 0] = initial_state.repeat(batch_size, 1)
@@ -97,36 +128,46 @@ class MPPIController:
         return total_costs, trajectories
     
     def compute_control(self, current_state: torch.Tensor) -> torch.Tensor:
+        """Compute and return the next control action."""
         action_sequences = self.sample_actions()
         costs, _ = self.rollout(current_state, action_sequences)
-        min_cost = torch.min(costs)
-        exp_costs = torch.exp(-(costs - min_cost) / self.temperature)
-        weights = exp_costs / torch.sum(exp_costs)
+        weights = self.compute_weights(costs)
+        self.adapt_temperature(weights)
+        weights = self.compute_weights(costs)
         optimal_action_sequence = torch.sum(weights.unsqueeze(-1).unsqueeze(-1) * action_sequences, dim=0)
         self.previous_action_sequence = optimal_action_sequence.detach()
+        self.step_count += 1
         return optimal_action_sequence[0]
     
-    def compute_control_with_info(self, current_state: torch.Tensor) -> Dict[str, Any]:
+    def compute_control_with_info(self, current_state: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
+        """Compute control and return diagnostic info."""
         action_sequences = self.sample_actions()
         costs, trajectories = self.rollout(current_state, action_sequences)
-        min_cost = torch.min(costs)
-        exp_costs = torch.exp(-(costs - min_cost) / self.temperature)
-        weights = exp_costs / torch.sum(exp_costs)
+        weights = self.compute_weights(costs)
+        self.adapt_temperature(weights)
+        weights = self.compute_weights(costs)
         optimal_action_sequence = torch.sum(weights.unsqueeze(-1).unsqueeze(-1) * action_sequences, dim=0)
         self.previous_action_sequence = optimal_action_sequence.detach()
         _, elite_indices = torch.topk(-costs, self.num_elite)
-        elite_costs = costs[elite_indices]
-        elite_trajectories = trajectories[elite_indices]
+        
         info = {
             'optimal_action_sequence': optimal_action_sequence,
             'all_costs': costs,
-            'elite_costs': elite_costs,
-            'elite_trajectories': elite_trajectories,
+            'elite_costs': costs[elite_indices],
+            'elite_trajectories': trajectories[elite_indices],
             'weights': weights,
-            'min_cost': min_cost,
-            'mean_cost': torch.mean(costs)
+            'min_cost': torch.min(costs),
+            'mean_cost': torch.mean(costs),
+            'temperature': self.temperature,
+            'noise_std': self.get_current_noise_std(),
+            'weight_entropy': self.compute_weight_entropy(weights),
         }
+        self.step_count += 1
         return optimal_action_sequence[0], info
     
     def reset(self):
+        """Reset internal controller state."""
         self.previous_action_sequence = None
+        self.step_count = 0
+        self.temperature = self.temperature_init
+        self.noise_std = self.noise_std_init
